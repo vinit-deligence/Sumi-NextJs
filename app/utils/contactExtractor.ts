@@ -92,18 +92,29 @@ export async function extractContactsWithLLM(
 
   // Create the extraction prompt (converted from Python)
   const prompt = `
-You are a multi-contact CRM extractor with integrated query routing. First determine if this should be routed directly to specialized agents, then extract contacts if needed.
+You are a CRM extraction agent. Understand the user's current message dynamically, use chat history to determine context, and extract exactly what is needed.
+
+Behavior:
+- Analyze EVERY query dynamically to understand what the user is saying
+- Use conversation history to determine if contacts/people mentioned are NEW or EXISTING
+- For NEW contacts: intent="add", leave update_contact empty
+- For EXISTING contacts: intent="update" or "list", populate update_contact if info is being changed
+- Extract activities (tasks, appointments, notes) based on what's mentioned in the current query
+- Maintain context from previous messages to understand references and relationships
 
 CONTEXT RULES (use conversation history if available):
-1. Query="yes/ok/sure" + Previous message asked "Would you like" → extract contact from previous message, set approved: true
-2. Query=ONLY phone/email/location (NO other details) + Previous message asked for it → merge with previous context, preserve all fields, set approved: true
-3. Query=COMPLETE REQUEST (has action+details) → extract ALL from current query, ignore history
-4. Pronouns (he/she/they) → use contact name from recent conversation
+1. Query="yes/ok/sure" + Previous message asked "Would you like" → extract ONLY the approval and set approved: true
+2. Query=ONLY phone/email/location (NO other details) + Previous message asked for it → extract ONLY that new field and merge with previous context; preserve other previously extracted fields; set approved: true
+3. Query=COMPLETE REQUEST (has action+details) → extract ALL from current message; ignore history except for pronoun/name resolution
+4. Pronouns (he/she/they) → use the most recent applicable contact name from conversation history
 
-Examples:
-- Previous: "Create contact for Sarah?" Current: "yes" → Extract Sarah Williams, approved: true
-- Previous: "What's the phone?" Current: "9181919120" → Add phone to Robert (from history), preserve stage/notes, approved: true
-- Previous: "What location?" Current: "Schedule showing at 789 Pine for Robert Saturday 10am" → EXTRACT ALL (showing, location, time) from current query
+DYNAMIC EXAMPLES:
+- Query: "Add John Smith" → NEW contact "John Smith", intent:"add", leave update_contact empty
+- Query: "Update John's phone to 555-1234" → EXISTING contact "John", intent:"update", fill update_contact with phone
+- Query: "Schedule meeting with John tomorrow" → EXISTING contact "John", intent:"list", leave update_contact empty, extract appointment
+- Query: "Just left showing at 123 Vista Way with the Nguyens. They loved it!" → NEW contact "Nguyen", intent:"add", leave update_contact empty
+- Query: "Call Sarah about the offer" → EXISTING contact "Sarah", intent:"list", leave update_contact empty, extract task
+- Query: "Sarah's email is sarah@email.com" → EXISTING contact "Sarah", intent:"update", fill update_contact with email
 
 STEP 1: ROUTING DETECTION
 Analyze the query type for optimal routing:
@@ -174,13 +185,23 @@ CRITICAL: Task vs Note Classification
 ✅ NOTE: "Client prefers properties under $500K" → Standalone background info
 ✅ NOTE: "Interested in downtown area" → Preference not tied to specific action
 
-Rules
-CONTACT INTENT DETERMINATION:
-- Contact info change (name, phone, email) ⇒ intent:"update", fill update_contact
-- Stage change (lead, prospect, client, lost, etc.) ⇒ intent:"update", fill update_contact
-- Only activity changes (tasks, appointments, notes) ⇒ contact intent:"list"
+DYNAMIC CONTACT ANALYSIS:
+For EVERY query, analyze the conversation history to determine:
 
-CRITICAL: If you populate update_contact with ANY data, the contact intent MUST be "update", not "list".
+1. CONTACT STATUS DETECTION:
+   - Check if person/contact mentioned in current query was mentioned before in chat history
+   - If NEVER mentioned before → NEW contact → intent:"add", leave update_contact empty
+   - If mentioned before → EXISTING contact → determine intent based on what's being changed
+
+2. INTENT DETERMINATION FOR EXISTING CONTACTS:
+   - If contact info is being changed (name, phone, email, stage) → intent:"update", fill update_contact
+   - If only activities are being added (tasks, appointments, notes) → intent:"list", leave update_contact empty
+   - If just referencing existing contact → intent:"list", leave update_contact empty
+
+3. DYNAMIC EXTRACTION:
+   - Extract what the user is actually saying in the current query
+   - Use chat history to understand context and relationships
+   - Don't assume - analyze each query individually
 
 Available stages: ${availableStagesStr}
 Extract stage if found in query, else "Lead". Use EXACT stage names from available stages list.
@@ -280,7 +301,7 @@ RESPONSE FORMAT (JSON):
 
     // Initialize LangChain LLM with structured output
     const llm = new ChatOpenAI({
-      modelName: "gpt-4o-mini", // or "gpt-4-turbo" for better accuracy
+      modelName: "gpt-4o", // or "gpt-4-turbo" for better accuracy
       temperature: 0.1, // Low temperature for consistent extraction
       apiKey: process.env.OPENAI_API_KEY,
     }).withStructuredOutput(ContactExtractionResponseZod);
