@@ -111,10 +111,13 @@ CONTEXT RULES (use conversation history if available):
 DYNAMIC EXAMPLES:
 - Query: "Add John Smith" → NEW contact "John Smith", intent:"add", leave update_contact empty
 - Query: "Update John's phone to 555-1234" → EXISTING contact "John", intent:"update", fill update_contact with phone
-- Query: "Schedule meeting with John tomorrow" → EXISTING contact "John", intent:"list", leave update_contact empty, extract appointment
+- Query: "Schedule meeting with John tomorrow" → EXISTING contact "John", intent:"add", leave update_contact empty, extract appointment
 - Query: "Just left showing at 123 Vista Way with the Nguyens. They loved it!" → NEW contact "Nguyen", intent:"add", leave update_contact empty
-- Query: "Call Sarah about the offer" → EXISTING contact "Sarah", intent:"list", leave update_contact empty, extract task
+- Query: "Call Sarah about the offer" → EXISTING contact "Sarah", intent:"add", leave update_contact empty, extract task
 - Query: "Sarah's email is sarah@email.com" → EXISTING contact "Sarah", intent:"update", fill update_contact with email
+- Query: "Schedule another showing for the Zillow lead next week" → EXISTING contact from Zillow, intent:"add", extract appointment
+- Query: "Update Frank's phone to 555-1234" → EXISTING contact "Frank", intent:"update", fill update_contact
+- Query: "Call the 858-555-2222 number" → EXISTING contact by phone, intent:"add", extract task
 
 STEP 1: ROUTING DETECTION
 Analyze the query type for optimal routing:
@@ -190,18 +193,24 @@ For EVERY query, analyze the conversation history to determine:
 
 1. CONTACT STATUS DETECTION:
    - Check if person/contact mentioned in current query was mentioned before in chat history
+   - Look for: exact name matches, phone number matches, email matches, or pronoun references (he/she/they)
    - If NEVER mentioned before → NEW contact → intent:"add", leave update_contact empty
    - If mentioned before → EXISTING contact → determine intent based on what's being changed
+   - Use fuzzy matching for names (Frank = Frank Peterson, John = John Smith)
 
 2. INTENT DETERMINATION FOR EXISTING CONTACTS:
    - If contact info is being changed (name, phone, email, stage) → intent:"update", fill update_contact
-   - If only activities are being added (tasks, appointments, notes) → intent:"list", leave update_contact empty
-   - If just referencing existing contact → intent:"list", leave update_contact empty
+   - If only activities are being added (tasks, appointments, notes) → intent:"add", leave update_contact empty
+   - If just referencing existing contact for viewing → intent:"list", leave update_contact empty
+   - If scheduling new activities with existing contact → intent:"add", leave update_contact empty
 
 3. DYNAMIC EXTRACTION:
    - Extract what the user is actually saying in the current query
    - Use chat history to understand context and relationships
    - Don't assume - analyze each query individually
+   - CRITICAL: When user says "another", "also", "also schedule", "the lead", "the client" → this refers to EXISTING contact from history
+   - CRITICAL: When user mentions phone numbers, emails, or partial names → check if they match existing contacts in history
+   - CRITICAL: When user says "Zillow lead", "the buyer", "the seller" → this refers to EXISTING contact from history
 
 Available stages: ${availableStagesStr}
 Extract stage if found in query, else "Lead". Use EXACT stage names from available stages list.
