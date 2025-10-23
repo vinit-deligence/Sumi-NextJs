@@ -46,7 +46,7 @@ export const InputContactSchemaZod = z.object({
   email: z.string().default(""),
   stage: z.string().default("Lead"),
   source: z.string().default("sumiAgent"),
-  intent: z.enum(["add", "update", "list"]).describe("Contact intent"),
+  intent: z.enum(["add", "update", "list", "delete"]).describe("Contact intent"),
   operation: z.string().default("list"),
   notes: z.array(NoteSchemaZod).default([]),
   tasks: z.array(TaskPairSchemaZod).default([]),

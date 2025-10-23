@@ -47,7 +47,7 @@ export interface InputContactSchema {
   email: string;
   stage: string;
   source: string;
-  intent: "add" | "update" | "list";
+  intent: "add" | "update" | "list" | "delete";
   operation: string;
   notes: NoteSchema[];
   tasks: TaskPairSchema[];

@@ -90,9 +90,59 @@ export async function extractContactsWithLLM(
   ];
   const availableStagesStr = availableStages.join(", ");
 
+  // Get chat history for context
+  const currentHistory = getMessageHistory(userId);
+  const historyMessages = await currentHistory.getMessages();
+  const chatHistoryContent = historyMessages
+    .filter(msg => msg._getType() === 'human')
+    .map(msg => typeof msg.content === 'string' ? msg.content : '')
+    .join('\n');
+
   // Create the extraction prompt (converted from Python)
   const prompt = `
 You are a CRM extraction agent. Understand the user's current message dynamically, use chat history to determine context, and extract exactly what is needed.
+
+CHAT HISTORY CONTEXT:
+${chatHistoryContent ? `Previous conversations:\n${chatHistoryContent}\n` : 'No previous conversations.'}
+
+CRITICAL: You MUST use the chat history context above to understand existing contacts and their information.
+
+CRITICAL DELETE INTENT DETECTION - CHECK FIRST:
+- If query contains "cancel" → intent MUST be "delete"
+- If query contains "delete" → intent MUST be "delete"  
+- If query contains "remove" → intent MUST be "delete"
+- These words ALWAYS mean delete intent, regardless of other words in the query
+
+CRITICAL CHAT HISTORY RULE - MUST FOLLOW FIRST:
+- If user mentions ANY activity (task, appointment, note) but NO specific contact name → use the MOST RECENT contact from chat history
+- If user says "Create task", "Add task", "Schedule call", "Prepare CMA" without mentioning contact name → use the MOST RECENT contact from history
+- NEVER create a new contact with empty name/phone/email when there's a contact in history
+- ALWAYS preserve contact information from chat history unless explicitly changed
+
+STEP 0: INTENT DETECTION - MUST BE DONE FIRST
+BEFORE doing anything else, analyze the query for intent keywords:
+
+1. DELETE INTENT (intent:"delete") - HIGHEST PRIORITY:
+   - Keywords: "cancel", "delete", "remove", "clear", "erase", "eliminate"
+   - Examples: "cancel last task", "delete appointment", "remove contact"
+   - CRITICAL: If query contains ANY of these words → intent:"delete" (ALWAYS)
+   - CRITICAL: "cancel" and "delete" are the strongest delete indicators
+   - CRITICAL: This intent takes priority over all other intents
+
+2. UPDATE INTENT (intent:"update"):
+   - Keywords: "update", "change", "modify", "edit", "fix"
+   - Examples: "update phone", "change email", "modify appointment"
+   - CRITICAL: If query contains ANY of these words → intent:"update" (ALWAYS)
+
+3. ADD INTENT (intent:"add"):
+   - Keywords: "add", "create", "new", "schedule", "book", "set up"
+   - Examples: "add task", "create appointment", "schedule call"
+   - CRITICAL: If query contains ANY of these words → intent:"add" (ALWAYS)
+
+4. LIST INTENT (intent:"list"):
+   - Keywords: "show", "list", "find", "display", "get", "check"
+   - Examples: "show appointments", "list contacts", "find tasks"
+   - CRITICAL: If query contains ANY of these words → intent:"list" (ALWAYS)
 
 Behavior:
 - Analyze EVERY query dynamically to understand what the user is saying
@@ -101,6 +151,8 @@ Behavior:
 - For EXISTING contacts: intent="update" or "list", populate update_contact if info is being changed
 - Extract activities (tasks, appointments, notes) based on what's mentioned in the current query
 - Maintain context from previous messages to understand references and relationships
+- CRITICAL: When user says "last one", "last task", "last appointment" → this means the MOST RECENT activity from chat history
+- CRITICAL: "Last one" refers to the most recently added item, NOT the first one in the list
 
 CONTEXT RULES (use conversation history if available):
 1. Query="yes/ok/sure" + Previous message asked "Would you like" → extract ONLY the approval and set approved: true
@@ -118,6 +170,24 @@ DYNAMIC EXAMPLES:
 - Query: "Schedule another showing for the Zillow lead next week" → EXISTING contact from Zillow, intent:"add", extract appointment
 - Query: "Update Frank's phone to 555-1234" → EXISTING contact "Frank", intent:"update", fill update_contact
 - Query: "Call the 858-555-2222 number" → EXISTING contact by phone, intent:"add", extract task
+- Query: "Schedule call for tomorrow" → EXISTING contact (most recent from history), intent:"add", extract task
+- Query: "Add task to prepare CMA" → EXISTING contact (most recent from history), intent:"add", extract task
+- Query: "Schedule appointment next week" → EXISTING contact (most recent from history), intent:"add", extract appointment
+- Query: "Send email reminder" → EXISTING contact (most recent from history), intent:"add", extract task
+- Query: "Create task to prepare CMA for 1234 Ocean View Drive by Monday" → EXISTING contact (most recent from history), intent:"add", extract task
+- Query: "Send comps to Sarah Williams by end of day Friday" → EXISTING contact "Sarah Williams" from history, intent:"add", extract task
+- Query: "Call Frank" → EXISTING contact "Frank Peterson", phone: "858-555-2222", email: "frank@email.com" (from history), intent:"add", extract task
+- Query: "Schedule showing with the 858-555-2222 number" → EXISTING contact by phone, use EXACT name/email from history, intent:"add", extract appointment
+- Query: "Send email to john@email.com" → EXISTING contact by email, use EXACT name/phone from history, intent:"add", extract task
+- Query: "Cancel the appointment" → EXISTING contact, intent:"delete", extract appointment to delete
+- Query: "Delete the task" → EXISTING contact, intent:"delete", extract task to delete
+- Query: "Remove the contact" → EXISTING contact, intent:"delete", extract contact to delete
+- Query: "Cancel last task" → EXISTING contact, intent:"delete", extract MOST RECENT task for deletion
+- Query: "Delete last appointment" → EXISTING contact, intent:"delete", extract MOST RECENT appointment for deletion
+- Query: "Remove last one" → EXISTING contact, intent:"delete", extract MOST RECENT activity for deletion
+- Query: "Update Frank's phone to 555-1234" → EXISTING contact "Frank", intent:"update", fill update_contact
+- Query: "Show me Frank's appointments" → EXISTING contact "Frank", intent:"list", leave update_contact empty
+- Query: "Find all tasks for John" → EXISTING contact "John", intent:"list", leave update_contact empty
 
 STEP 1: ROUTING DETECTION
 Analyze the query type for optimal routing:
@@ -175,11 +245,46 @@ Appointments: scheduled live interactions (meetings, showings, consultations). A
 
 Appointment titles: "Property Showing"/"Showing at [address]", "Buyer Consultation", "Client Meeting". NEVER empty.
 
-Intents
-add: add/create/new/save/register/schedule/book/set up
-update: update/change/modify/edit/fix/reschedule/move
-delete: remove/cancel/clear/erase/eliminate
-list: find/search/show/display/lookup
+Intents - CRITICAL: Always detect intent correctly based on keywords:
+
+ADD INTENT (intent:"add"):
+- Keywords: add, create, new, save, register, schedule, book, set up, plan, arrange
+- Examples: "Schedule call", "Add task", "Create appointment", "Book showing"
+
+UPDATE INTENT (intent:"update"):  
+- Keywords: update, change, modify, edit, fix, reschedule, move, adjust
+- Examples: "Update phone", "Change email", "Modify appointment", "Fix address"
+
+DELETE INTENT (intent:"delete"):
+- Keywords: delete, remove, cancel, clear, erase, eliminate, drop, stop
+- Examples: "Cancel appointment", "Delete task", "Remove contact", "Clear schedule"
+
+LIST INTENT (intent:"list"):
+- Keywords: find, search, show, display, lookup, view, get, retrieve, check
+- Examples: "Show appointments", "Find contact", "Get schedule", "Check tasks"
+
+CRITICAL INTENT DETECTION RULES - MUST FOLLOW THESE RULES:
+1. FIRST: Check for DELETE keywords: "cancel", "delete", "remove", "clear", "erase", "eliminate"
+   - If ANY of these words appear → intent:"delete" (ALWAYS)
+2. SECOND: Check for UPDATE keywords: "update", "change", "modify", "edit", "fix"
+   - If ANY of these words appear → intent:"update" (ALWAYS)
+3. THIRD: Check for ADD keywords: "add", "create", "new", "schedule", "book", "set up"
+   - If ANY of these words appear → intent:"add" (ALWAYS)
+4. FOURTH: Check for LIST keywords: "show", "list", "find", "display", "get", "check"
+   - If ANY of these words appear → intent:"list" (ALWAYS)
+
+CRITICAL EXAMPLES:
+- "cancel last task" → intent:"delete" (contains "cancel")
+- "delete the appointment" → intent:"delete" (contains "delete")
+- "remove contact" → intent:"delete" (contains "remove")
+- "update phone" → intent:"update" (contains "update")
+- "schedule call" → intent:"add" (contains "schedule")
+- "show appointments" → intent:"list" (contains "show")
+
+CHAT HISTORY EXAMPLES:
+- Previous: "Met Sarah Williams... phone 619-555-1234" → Contact: Sarah Williams
+- Current: "Create task to prepare CMA" → Use Sarah Williams from history, intent:"add"
+- Result: Sarah Williams with new task, NOT new empty contact
 
 CRITICAL: Task vs Note Classification
 ✅ TASK: "Create task to prepare CMA for 1234 Ocean View Drive" → ONE task with full description
@@ -199,18 +304,39 @@ For EVERY query, analyze the conversation history to determine:
    - Use fuzzy matching for names (Frank = Frank Peterson, John = John Smith)
 
 2. INTENT DETERMINATION FOR EXISTING CONTACTS:
-   - If contact info is being changed (name, phone, email, stage) → intent:"update", fill update_contact
-   - If only activities are being added (tasks, appointments, notes) → intent:"add", leave update_contact empty
-   - If just referencing existing contact for viewing → intent:"list", leave update_contact empty
-   - If scheduling new activities with existing contact → intent:"add", leave update_contact empty
+   - CRITICAL: Analyze the query keywords to determine intent:
+   - If query contains "cancel", "delete", "remove" → intent:"delete", leave update_contact empty
+   - If query contains "update", "change", "modify" → intent:"update", fill update_contact
+   - If query contains "add", "create", "schedule" → intent:"add", leave update_contact empty
+   - If query contains "show", "list", "find" → intent:"list", leave update_contact empty
+   - CRITICAL: Intent is determined by ACTION keywords, not by contact status
 
 3. DYNAMIC EXTRACTION:
    - Extract what the user is actually saying in the current query
    - Use chat history to understand context and relationships
    - Don't assume - analyze each query individually
    - CRITICAL: When user says "another", "also", "also schedule", "the lead", "the client" → this refers to EXISTING contact from history
-   - CRITICAL: When user mentions phone numbers, emails, or partial names → check if they match existing contacts in history
-   - CRITICAL: When user says "Zillow lead", "the buyer", "the seller" → this refers to EXISTING contact from history
+- CRITICAL: When user mentions phone numbers, emails, or partial names → check if they match existing contacts in history
+- CRITICAL: When user says "Zillow lead", "the buyer", "the seller" → this refers to EXISTING contact from history
+- CRITICAL: When user says "last one", "last task", "last appointment" → this refers to the MOST RECENT activity from chat history
+- CRITICAL: "Last one" means the most recently added task/appointment/note, NOT the first one
+- CRITICAL: For "cancel last task" → find the MOST RECENT task from chat history and mark it for deletion
+- CRITICAL: For "delete last appointment" → find the MOST RECENT appointment from chat history and mark it for deletion
+
+4. PERSISTENT CONTACT CONTEXT - CRITICAL RULES:
+   - CRITICAL: If contact exists in chat history, ALWAYS use the EXACT SAME name, phone, email from history
+   - CRITICAL: NEVER change contact info unless user explicitly provides NEW information
+- CRITICAL: If user says "Schedule call" without mentioning contact name → use MOST RECENT contact's name, phone, email from history
+- CRITICAL: If user says "Add task" without mentioning contact name → use MOST RECENT contact's name, phone, email from history
+- CRITICAL: If user says "Schedule appointment" without mentioning contact name → use MOST RECENT contact's name, phone, email from history
+- CRITICAL: If user says "Create task" without mentioning contact name → use MOST RECENT contact's name, phone, email from history
+- CRITICAL: If user says "Prepare CMA" without mentioning contact name → use MOST RECENT contact's name, phone, email from history
+- CRITICAL: If user says "Send comps" without mentioning contact name → use MOST RECENT contact's name, phone, email from history
+   - CRITICAL: Preserve ALL contact details (first_name, last_name, phone, email, stage, source) from history
+   - CRITICAL: Only extract NEW activities (tasks, appointments, notes) for existing contacts
+   - CRITICAL: If user mentions "Frank" and Frank exists in history → use Frank's EXACT name, phone, email from history
+   - CRITICAL: If user mentions phone "858-555-2222" and this phone exists in history → use the EXACT name, email from that contact
+   - CRITICAL: If user mentions email "john@email.com" and this email exists in history → use the EXACT name, phone from that contact
 
 Available stages: ${availableStagesStr}
 Extract stage if found in query, else "Lead". Use EXACT stage names from available stages list.
@@ -239,6 +365,17 @@ CRITICAL:
 - If current query has complete details (action + specifics) → extract ALL from current query
 - If current query is ONLY yes/no OR ONLY phone/email/location → use history to merge
 - NEVER return 'N/A' values if actual data exists in current query
+- CRITICAL: For EXISTING contacts, ALWAYS preserve first_name, last_name, phone, email, stage, source from chat history
+- CRITICAL: Only extract NEW activities (tasks, appointments, notes) for existing contacts
+- CRITICAL: If user doesn't mention contact name but mentions activity → use MOST RECENT contact from history
+- CRITICAL: If user says "Schedule call" without name → use most recent contact's name, phone, email from history
+- CRITICAL: If user says "Create task" without name → use most recent contact's name, phone, email from history
+- CRITICAL: If user says "Prepare CMA" without name → use most recent contact's name, phone, email from history
+- CRITICAL: NEVER change contact name, phone, or email unless user explicitly provides NEW information
+- CRITICAL: When no contact name is mentioned, ALWAYS use the most recent contact from chat history
+- CRITICAL: If user mentions "Frank" → use Frank's EXACT name, phone, email from history (don't change them)
+- CRITICAL: If user mentions phone number → use the EXACT name, email from that contact in history
+- CRITICAL: If user mentions email → use the EXACT name, phone from that contact in history
 
 Only include appointments/tasks/notes arrays if they are EXPLICITLY mentioned in the query.
 - If query has NO appointments mentioned → appointments: []
@@ -263,6 +400,23 @@ For update/delete/list → operation:"list".
 Apply context rules if conversation history is available: approval responses and phone/email follow-ups get approved: true.
 
 Extract contacts, tasks, appointments, and notes from the user's query. Return structured JSON output.
+
+CRITICAL: Before returning the response, double-check that the intent is correct:
+- If query contains "cancel", "delete", "remove" → intent MUST be "delete" (HIGHEST PRIORITY)
+- If query contains "update", "change", "modify" → intent MUST be "update"  
+- If query contains "add", "create", "schedule" → intent MUST be "add"
+- If query contains "show", "list", "find" → intent MUST be "list"
+
+CRITICAL DELETE INTENT VERIFICATION:
+- "cancel last task" → intent:"delete" (contains "cancel")
+- "delete the appointment" → intent:"delete" (contains "delete")
+- "remove contact" → intent:"delete" (contains "remove")
+- "can you cancel" → intent:"delete" (contains "cancel")
+
+CRITICAL: Before returning the response, double-check chat history usage:
+- If no contact name mentioned but activity mentioned → use MOST RECENT contact from history
+- NEVER return empty contact (no name/phone/email) when there's a contact in history
+- ALWAYS preserve contact details from chat history
 
 RESPONSE FORMAT (JSON):
 {
@@ -297,9 +451,6 @@ RESPONSE FORMAT (JSON):
     console.log(`💬 User ID: ${userId}`);
     console.log(`📝 Query: "${query}"`);
 
-    // Get chat history manually
-    const currentHistory = getMessageHistory(userId);
-    const historyMessages = await currentHistory.getMessages();
     console.log(`📚 History before invoke: ${historyMessages.length} messages`);
     if (historyMessages.length > 0) {
       console.log(`📜 Last messages:`, historyMessages.slice(-2).map(m => ({
@@ -307,6 +458,8 @@ RESPONSE FORMAT (JSON):
         content: typeof m.content === 'string' ? m.content.substring(0, 100) : m.content
       })));
     }
+    
+    console.log(`📋 Chat history content: ${chatHistoryContent.substring(0, 200)}...`);
 
     // Initialize LangChain LLM with structured output
     const llm = new ChatOpenAI({
