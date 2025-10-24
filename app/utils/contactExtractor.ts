@@ -105,9 +105,22 @@ export async function extractContactsWithLLM(
   let firstContactWithActivities = null;
   let firstContactInfo = null;
   
-  // Check if current query mentions a new contact name
+  // Check if current query mentions a new contact name (but not addresses)
   const currentQueryContactMatch = query.match(/([A-Z][a-z]+(?:\.)? [A-Z][a-z]+)/);
-  const currentQueryContact = currentQueryContactMatch ? currentQueryContactMatch[1] : null;
+  let currentQueryContact = currentQueryContactMatch ? currentQueryContactMatch[1] : null;
+  
+  // Filter out addresses and locations (like "Pine Ave", "Elm St")
+  if (currentQueryContact && (
+    currentQueryContact.includes('Ave') || 
+    currentQueryContact.includes('St') || 
+    currentQueryContact.includes('Rd') || 
+    currentQueryContact.includes('Blvd') ||
+    currentQueryContact.includes('Dr') ||
+    currentQueryContact.includes('Way') ||
+    currentQueryContact.includes('Ln')
+  )) {
+    currentQueryContact = null; // Don't treat addresses as contact names
+  }
   
   // Track all contacts from conversation in chronological order
   const allContactsWithActivities = [];
@@ -195,10 +208,13 @@ RULES:
 2. If "last task/appointment" → use Most Recent contact  
 3. If "first task/appointment" → use First contact
 4. If no name mentioned → use Most Recent contact
+5. CRITICAL: When no contact name is mentioned, ALWAYS use the most recent contact from chat history
+6. CRITICAL: NEVER create empty contacts when there's a contact in history
 
 CRITICAL: When query mentions a specific contact name, IGNORE chat history and use that contact.
 
 EXAMPLE: If query is "Update Jane Miller's email" → use Jane Miller, NOT Sarah Williams from history.
+EXAMPLE: If query is "Schedule showing at 789 Pine Ave" → use Sarah Williams from history, NOT create empty contact.
 
 INTENTS:
 - DELETE: "cancel", "delete", "remove" → intent:"delete"
