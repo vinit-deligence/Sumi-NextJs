@@ -105,22 +105,8 @@ export async function extractContactsWithLLM(
   let firstContactWithActivities = null;
   let firstContactInfo = null;
   
-  // Check if current query mentions a new contact name (but not addresses)
-  const currentQueryContactMatch = query.match(/([A-Z][a-z]+(?:\.)? [A-Z][a-z]+)/);
-  let currentQueryContact = currentQueryContactMatch ? currentQueryContactMatch[1] : null;
-  
-  // Filter out addresses and locations (like "Pine Ave", "Elm St")
-  if (currentQueryContact && (
-    currentQueryContact.includes('Ave') || 
-    currentQueryContact.includes('St') || 
-    currentQueryContact.includes('Rd') || 
-    currentQueryContact.includes('Blvd') ||
-    currentQueryContact.includes('Dr') ||
-    currentQueryContact.includes('Way') ||
-    currentQueryContact.includes('Ln')
-  )) {
-    currentQueryContact = null; // Don't treat addresses as contact names
-  }
+  // Let LLM handle contact detection - no regex needed
+  const currentQueryContact = null; // Always let LLM determine contact from context
   
   // Track all contacts from conversation in chronological order
   const allContactsWithActivities = [];
@@ -169,30 +155,7 @@ export async function extractContactsWithLLM(
     mostRecentContactInfo = null; // Clear old contact info
   }
   
-  // Fallback: Parse chat history to find the most recent contact with activities
-  if (!mostRecentActiveContact) {
-    const historyLines = chatHistoryContent.split('\n').filter(line => line.trim());
-    for (let i = historyLines.length - 1; i >= 0; i--) {
-      const line = historyLines[i];
-      // Look for patterns that indicate contact with activities
-      if (line.includes('task') || line.includes('appointment') || line.includes('call') || line.includes('schedule') || line.includes('Mrs.') || line.includes('Mr.')) {
-        // Extract contact name from this line - improved pattern matching
-        const nameMatch = line.match(/(?:Met|New lead|Contact|Call|Schedule|Mrs\.|Mr\.).*?([A-Z][a-z]+(?:\.)? [A-Z][a-z]+)/);
-        if (nameMatch) {
-          mostRecentActiveContact = nameMatch[1];
-          mostRecentActivity = line;
-          break;
-        }
-        // Also try to match single names followed by activities
-        const singleNameMatch = line.match(/([A-Z][a-z]+(?:\.)? [A-Z][a-z]+).*?(?:task|appointment|call|schedule)/);
-        if (singleNameMatch) {
-          mostRecentActiveContact = singleNameMatch[1];
-          mostRecentActivity = line;
-          break;
-        }
-      }
-    }
-  }
+  // Let LLM handle contact detection from chat history - no regex parsing needed
 
   // Create the extraction prompt (converted from Python)
   const prompt = `
@@ -252,12 +215,9 @@ RESPONSE FORMAT:
     
     console.log(`📋 Chat history content: ${chatHistoryContent.substring(0, 200)}...`);
     console.log(`🎯 Most recent active contact: ${mostRecentActiveContact || 'None'}`);
-    console.log(`📝 Most recent activity: ${mostRecentActivity || 'None'}`);
     console.log(`🥇 First active contact: ${firstContactWithActivities || 'None'}`);
     console.log(`📊 All contacts in order: ${allContactsWithActivities.map(c => c.contact).join(' → ')}`);
-    if (currentQueryContact) {
-      console.log(`🆕 Current query contact: ${currentQueryContact} (will override most recent)`);
-    }
+    console.log(`🤖 Using LLM for contact detection (no regex patterns)`);
     if (mostRecentContactInfo) {
       console.log(`👤 Most recent contact info: ${JSON.stringify(mostRecentContactInfo, null, 2)}`);
     }
