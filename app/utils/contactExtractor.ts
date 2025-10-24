@@ -98,6 +98,75 @@ export async function extractContactsWithLLM(
     .map(msg => typeof msg.content === 'string' ? msg.content : '')
     .join('\n');
 
+  // Analyze chat history to find the most recent contact with activities
+  let mostRecentActiveContact = null;
+  let mostRecentActivity = null;
+  let mostRecentContactInfo = null;
+  let firstContactWithActivities = null;
+  let firstContactInfo = null;
+  
+  // First, try to parse JSON responses from previous extractions
+  const allContactsWithActivities = [];
+  
+  for (let i = historyMessages.length - 1; i >= 0; i--) {
+    const msg = historyMessages[i];
+    if (msg._getType() === 'ai' && typeof msg.content === 'string') {
+      try {
+        const parsedResponse = JSON.parse(msg.content);
+        if (parsedResponse.contacts && parsedResponse.contacts.length > 0) {
+          const contact = parsedResponse.contacts[0].input_contact;
+          if (contact.tasks && contact.tasks.length > 0 || contact.appointments && contact.appointments.length > 0) {
+            allContactsWithActivities.push({
+              contact: `${contact.first_name} ${contact.last_name}`.trim(),
+              info: contact,
+              timestamp: i // Use message index as timestamp
+            });
+            
+            // Set most recent (first one we find going backwards)
+            if (!mostRecentActiveContact) {
+              mostRecentActiveContact = `${contact.first_name} ${contact.last_name}`.trim();
+              mostRecentContactInfo = contact;
+            }
+          }
+        }
+      } catch (e) {
+        // Not JSON, continue
+      }
+    }
+  }
+  
+  // Set first contact (last one in the array since we went backwards)
+  if (allContactsWithActivities.length > 0) {
+    const firstContact = allContactsWithActivities[allContactsWithActivities.length - 1];
+    firstContactWithActivities = firstContact.contact;
+    firstContactInfo = firstContact.info;
+  }
+  
+  // Fallback: Parse chat history to find the most recent contact with activities
+  if (!mostRecentActiveContact) {
+    const historyLines = chatHistoryContent.split('\n').filter(line => line.trim());
+    for (let i = historyLines.length - 1; i >= 0; i--) {
+      const line = historyLines[i];
+      // Look for patterns that indicate contact with activities
+      if (line.includes('task') || line.includes('appointment') || line.includes('call') || line.includes('schedule') || line.includes('Mrs.') || line.includes('Mr.')) {
+        // Extract contact name from this line - improved pattern matching
+        const nameMatch = line.match(/(?:Met|New lead|Contact|Call|Schedule|Mrs\.|Mr\.).*?([A-Z][a-z]+(?:\.)? [A-Z][a-z]+)/);
+        if (nameMatch) {
+          mostRecentActiveContact = nameMatch[1];
+          mostRecentActivity = line;
+          break;
+        }
+        // Also try to match single names followed by activities
+        const singleNameMatch = line.match(/([A-Z][a-z]+(?:\.)? [A-Z][a-z]+).*?(?:task|appointment|call|schedule)/);
+        if (singleNameMatch) {
+          mostRecentActiveContact = singleNameMatch[1];
+          mostRecentActivity = line;
+          break;
+        }
+      }
+    }
+  }
+
   // Create the extraction prompt (converted from Python)
   const prompt = `
 You are a CRM extraction agent. Understand the user's current message dynamically, use chat history to determine context, and extract exactly what is needed.
@@ -105,7 +174,18 @@ You are a CRM extraction agent. Understand the user's current message dynamicall
 CHAT HISTORY CONTEXT:
 ${chatHistoryContent ? `Previous conversations:\n${chatHistoryContent}\n` : 'No previous conversations.'}
 
+MOST RECENT ACTIVE CONTACT: ${mostRecentActiveContact || 'None identified'}
+MOST RECENT ACTIVITY: ${mostRecentActivity || 'None identified'}
+${mostRecentContactInfo ? `MOST RECENT CONTACT INFO: ${JSON.stringify(mostRecentContactInfo, null, 2)}` : ''}
+
+FIRST ACTIVE CONTACT: ${firstContactWithActivities || 'None identified'}
+${firstContactInfo ? `FIRST CONTACT INFO: ${JSON.stringify(firstContactInfo, null, 2)}` : ''}
+
 CRITICAL: You MUST use the chat history context above to understand existing contacts and their information.
+CRITICAL: When user says "last task", "last appointment", "last one" → use the MOST RECENT ACTIVE CONTACT identified above.
+CRITICAL: When user says "first task", "first appointment", "first one" → use the FIRST ACTIVE CONTACT identified above.
+CRITICAL: If MOST RECENT CONTACT INFO is provided, use the EXACT contact details (name, phone, email) from that info.
+CRITICAL: If FIRST CONTACT INFO is provided, use the EXACT contact details (name, phone, email) from that info.
 
 CRITICAL DELETE INTENT DETECTION - CHECK FIRST:
 - If query contains "cancel" → intent MUST be "delete"
@@ -118,6 +198,8 @@ CRITICAL CHAT HISTORY RULE - MUST FOLLOW FIRST:
 - If user says "Create task", "Add task", "Schedule call", "Prepare CMA" without mentioning contact name → use the MOST RECENT contact from history
 - NEVER create a new contact with empty name/phone/email when there's a contact in history
 - ALWAYS preserve contact information from chat history unless explicitly changed
+- CRITICAL: When user says "last task", "last appointment", "last one" → this refers to the MOST RECENT activity from the MOST RECENT contact that had activities
+- CRITICAL: Track which contact was most recently active with tasks/appointments to determine context for "last" references
 
 STEP 0: INTENT DETECTION - MUST BE DONE FIRST
 BEFORE doing anything else, analyze the query for intent keywords:
@@ -151,8 +233,12 @@ Behavior:
 - For EXISTING contacts: intent="update" or "list", populate update_contact if info is being changed
 - Extract activities (tasks, appointments, notes) based on what's mentioned in the current query
 - Maintain context from previous messages to understand references and relationships
-- CRITICAL: When user says "last one", "last task", "last appointment" → this means the MOST RECENT activity from chat history
-- CRITICAL: "Last one" refers to the most recently added item, NOT the first one in the list
+- CRITICAL: When user says "last one", "last task", "last appointment" → this means the MOST RECENT activity from the MOST RECENT ACTIVE CONTACT
+- CRITICAL: When user says "first one", "first task", "first appointment" → this means the FIRST activity in the sequence
+- CRITICAL: "Last one" refers to the most recently added item from the most recently active contact, NOT the first one in the list
+- CRITICAL: "First one" refers to the first item in the sequence, NOT the most recent one
+- CRITICAL: Use the MOST RECENT ACTIVE CONTACT identified in the context above for "last" references
+- CRITICAL: For "first" references, use the contact that has the first task/appointment in their sequence
 
 CONTEXT RULES (use conversation history if available):
 1. Query="yes/ok/sure" + Previous message asked "Would you like" → extract ONLY the approval and set approved: true
@@ -182,9 +268,13 @@ DYNAMIC EXAMPLES:
 - Query: "Cancel the appointment" → EXISTING contact, intent:"delete", extract appointment to delete
 - Query: "Delete the task" → EXISTING contact, intent:"delete", extract task to delete
 - Query: "Remove the contact" → EXISTING contact, intent:"delete", extract contact to delete
-- Query: "Cancel last task" → EXISTING contact, intent:"delete", extract MOST RECENT task for deletion
-- Query: "Delete last appointment" → EXISTING contact, intent:"delete", extract MOST RECENT appointment for deletion
-- Query: "Remove last one" → EXISTING contact, intent:"delete", extract MOST RECENT activity for deletion
+- Query: "Cancel last task" → EXISTING contact (MOST RECENT ACTIVE CONTACT), intent:"delete", extract MOST RECENT task for deletion
+- Query: "Delete last appointment" → EXISTING contact (MOST RECENT ACTIVE CONTACT), intent:"delete", extract MOST RECENT appointment for deletion
+- Query: "Remove last one" → EXISTING contact (MOST RECENT ACTIVE CONTACT), intent:"delete", extract MOST RECENT activity for deletion
+- Query: "can you delete last task?" → EXISTING contact (MOST RECENT ACTIVE CONTACT), intent:"delete", extract MOST RECENT task for deletion
+- Query: "Delete first task" → EXISTING contact, intent:"delete", extract FIRST task in sequence for deletion
+- Query: "Cancel first appointment" → EXISTING contact, intent:"delete", extract FIRST appointment in sequence for deletion
+- Query: "Remove first one" → EXISTING contact, intent:"delete", extract FIRST activity in sequence for deletion
 - Query: "Update Frank's phone to 555-1234" → EXISTING contact "Frank", intent:"update", fill update_contact
 - Query: "Show me Frank's appointments" → EXISTING contact "Frank", intent:"list", leave update_contact empty
 - Query: "Find all tasks for John" → EXISTING contact "John", intent:"list", leave update_contact empty
@@ -460,6 +550,15 @@ RESPONSE FORMAT (JSON):
     }
     
     console.log(`📋 Chat history content: ${chatHistoryContent.substring(0, 200)}...`);
+    console.log(`🎯 Most recent active contact: ${mostRecentActiveContact || 'None'}`);
+    console.log(`📝 Most recent activity: ${mostRecentActivity || 'None'}`);
+    console.log(`🥇 First active contact: ${firstContactWithActivities || 'None'}`);
+    if (mostRecentContactInfo) {
+      console.log(`👤 Most recent contact info: ${JSON.stringify(mostRecentContactInfo, null, 2)}`);
+    }
+    if (firstContactInfo) {
+      console.log(`👤 First contact info: ${JSON.stringify(firstContactInfo, null, 2)}`);
+    }
 
     // Initialize LangChain LLM with structured output
     const llm = new ChatOpenAI({
