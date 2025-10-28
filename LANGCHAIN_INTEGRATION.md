@@ -2,7 +2,7 @@
 
 ## Overview
 
-The chatbot now uses **LangChain.js** with **RunnableWithMessageHistory** for advanced conversation management and structured output generation. This provides persistent chat history and context-aware responses.
+The chatbot uses **LangChain.js** with **Custom ConversationSummaryMemory** for efficient conversation management and structured output generation. This provides intelligent memory summarization, token usage tracking, and context-aware responses.
 
 ## Key Features
 
@@ -12,13 +12,22 @@ The chatbot now uses **LangChain.js** with **RunnableWithMessageHistory** for ad
 - **Automatic validation** of extracted data
 - **IntelliSense support** in TypeScript
 
-### 2. Message History Management
+### 2. Conversation Summary Memory
+- **Automatic summarization** of older messages to conserve tokens
+- **Smart memory management** keeping recent messages + summary
+- **Token usage tracking** per session with detailed statistics
 - **Persistent conversations** across multiple queries
 - **Session-based storage** using user IDs
 - **In-memory storage** for development (easily swappable for Redis/DB)
 - **Context-aware extraction** using conversation history
 
-### 3. Chain Architecture
+### 3. Token Usage Monitoring
+- **Real-time tracking** of prompt, completion, and total tokens
+- **Per-session statistics** with message counts and timestamps
+- **Cost optimization** using gpt-4o-mini for summaries
+- **API response includes** token usage information
+
+### 4. Chain Architecture
 - **Modular design** with LangChain chains
 - **Prompt templates** with placeholders for history
 - **Composable components** for easy customization
@@ -30,21 +39,36 @@ The chatbot now uses **LangChain.js** with **RunnableWithMessageHistory** for ad
 User Query
     ↓
 [Frontend (page.tsx)]
-    ↓ userId + message
+    ↓ userId + message + timezone
 [API Route (/api/chat)]
     ↓
 [extractContactsWithLLM]
     ↓
-[LangChain Chain]
-    ├── ChatPromptTemplate (system + history + user)
-    ├── ChatOpenAI (gpt-4o-mini with structured output)
+[Load Conversation Memory]
+    ├── getConversationMemory(userId)
+    ├── Load summary (if exists)
+    └── Load recent messages (last 4-10)
+    ↓
+[LangChain LLM]
+    ├── System Prompt (extraction rules)
+    ├── Memory Summary (as SystemMessage)
+    ├── Recent History (HumanMessage + AIMessage)
+    ├── ChatOpenAI (gpt-4o with structured output)
+    ├── Token Usage Callbacks (track usage)
     └── ContactExtractionResponseZod (Zod schema)
     ↓
-[RunnableWithMessageHistory]
-    ├── getMessageHistory(userId)
-    └── InMemoryChatMessageHistory
+[Save to Memory]
+    ├── Add HumanMessage + AIMessage
+    ├── Check message count (> 10?)
+    └── Summarize if needed (gpt-4o-mini)
     ↓
-[Structured JSON Response]
+[Track Token Usage]
+    ├── Update session stats
+    └── Log usage metrics
+    ↓
+[API Response]
+    ├── Structured JSON Response
+    └── Token Usage Statistics
     ↓
 [Frontend Display with JSON Viewer]
 ```
@@ -71,49 +95,151 @@ export const ContactExtractionResponseZod = z.object({
 
 ### Contact Extractor (`app/utils/contactExtractor.ts`)
 
-#### Message History Storage
+#### Conversation Summary Memory
 ```typescript
-const messageHistories: Record<string, InMemoryChatMessageHistory> = {};
+// Custom memory structure
+interface ConversationMemory {
+  summary: string;
+  recentMessages: BaseMessage[];
+  messageCount: number;
+  maxMessages: number;  // Default: 10
+}
 
-function getMessageHistory(sessionId: string): InMemoryChatMessageHistory {
-  if (!messageHistories[sessionId]) {
-    messageHistories[sessionId] = new InMemoryChatMessageHistory();
+const conversationMemories: Record<string, ConversationMemory> = {};
+
+function getConversationMemory(sessionId: string): ConversationMemory {
+  if (!conversationMemories[sessionId]) {
+    conversationMemories[sessionId] = {
+      summary: '',
+      recentMessages: [],
+      messageCount: 0,
+      maxMessages: 10,
+    };
   }
-  return messageHistories[sessionId];
+  return conversationMemories[sessionId];
 }
 ```
 
-#### LangChain Chain Setup
+#### Token Usage Tracking
 ```typescript
-// 1. Create LLM with structured output
+interface TokenUsageStats {
+  totalTokens: number;
+  promptTokens: number;
+  completionTokens: number;
+  messagesCount: number;
+  lastUpdated: Date;
+}
+
+const tokenUsageStats: Record<string, TokenUsageStats> = {};
+
+function updateTokenUsage(
+  sessionId: string, 
+  usage: { promptTokens: number; completionTokens: number; totalTokens: number }
+): void {
+  const stats = getTokenUsageStats(sessionId);
+  stats.totalTokens += usage.totalTokens;
+  stats.promptTokens += usage.promptTokens;
+  stats.completionTokens += usage.completionTokens;
+  stats.messagesCount += 1;
+  stats.lastUpdated = new Date();
+}
+```
+
+#### Automatic Summarization
+```typescript
+async function summarizeConversation(
+  messages: BaseMessage[], 
+  sessionId: string
+): Promise<string> {
+  const llm = new ChatOpenAI({
+    modelName: "gpt-4o-mini",  // Cheaper model for summaries
+    temperature: 0,
+    callbacks: [
+      {
+        handleLLMEnd: async (output) => {
+          // Track tokens used for summarization
+          if (output.llmOutput?.tokenUsage) {
+            updateTokenUsage(sessionId, output.llmOutput.tokenUsage);
+          }
+        },
+      },
+    ],
+  });
+
+  const conversationText = messages
+    .map((m) => `${m._getType()}: ${m.content}`)
+    .join('\n');
+
+  const summaryPrompt = `Summarize the following conversation, preserving key contact information, activities, and context:\n\n${conversationText}\n\nSummary:`;
+  
+  const summary = await llm.invoke([new HumanMessage(summaryPrompt)]);
+  return summary.content;
+}
+```
+
+#### Memory Management
+```typescript
+async function saveConversationToMemory(
+  sessionId: string,
+  userMessage: string,
+  aiResponse: string
+): Promise<void> {
+  const memory = getConversationMemory(sessionId);
+  
+  // Add new messages
+  memory.recentMessages.push(new HumanMessage(userMessage));
+  memory.recentMessages.push(new AIMessage(aiResponse));
+  memory.messageCount += 2;
+
+  // Summarize if too many messages
+  if (memory.recentMessages.length > memory.maxMessages) {
+    // Keep last 4 messages, summarize the rest
+    const messagesToSummarize = memory.recentMessages.slice(0, -4);
+    const recentMessages = memory.recentMessages.slice(-4);
+    
+    const newSummary = await summarizeConversation(messagesToSummarize, sessionId);
+    
+    memory.summary = memory.summary 
+      ? `Previous summary: ${memory.summary}\n\n${newSummary}`
+      : newSummary;
+    memory.recentMessages = recentMessages;
+  }
+}
+```
+
+#### LangChain LLM Setup with Token Tracking
+```typescript
+// 1. Create LLM with structured output and callbacks
 const llm = new ChatOpenAI({
-  modelName: "gpt-4o-mini",
+  modelName: "gpt-4o",
   temperature: 0.1,
+  callbacks: [
+    {
+      handleLLMEnd: async (output) => {
+        // Track token usage
+        if (output.llmOutput?.tokenUsage) {
+          updateTokenUsage(userId, output.llmOutput.tokenUsage);
+        }
+      },
+    },
+  ],
 }).withStructuredOutput(ContactExtractionResponseZod);
 
-// 2. Create prompt template with history placeholder
-const promptTemplate = ChatPromptTemplate.fromMessages([
-  ["system", "You are a CRM contact extraction assistant..."],
-  ["placeholder", "{chat_history}"],
-  ["human", "{input}"],
-]);
+// 2. Load memory with summary and recent messages
+const historyMessages = loadConversationMemory(userId);
 
-// 3. Create chain
-const chain = promptTemplate.pipe(llm);
+// 3. Build messages array
+const messages = [
+  ["system", extractionPrompt],
+  ...historyMessages,  // Includes summary as SystemMessage if exists
+  ["human", `Extract contact information from: ${query}`],
+];
 
-// 4. Wrap with message history
-const chainWithHistory = new RunnableWithMessageHistory({
-  runnable: chain,
-  getMessageHistory: (sessionId) => getMessageHistory(sessionId),
-  inputMessagesKey: "input",
-  historyMessagesKey: "chat_history",
-});
+// 4. Invoke LLM
+const result = await llm.invoke(messages);
 
-// 5. Invoke with session ID
-const result = await chainWithHistory.invoke(
-  { input: prompt },
-  { configurable: { sessionId: userId } }
-);
+// 5. Save to memory (automatic summarization if needed)
+await saveConversationToMemory(userId, query, JSON.stringify(result));
 ```
 
 ### User Session Management (`app/page.tsx`)
@@ -273,7 +399,7 @@ function getMessageHistory(sessionId: string) {
 ## API Reference
 
 ### `extractContactsWithLLM(query, userTimezone, userId)`
-Main extraction function using LangChain.
+Main extraction function using LangChain with conversation summary memory.
 
 **Parameters:**
 - `query` (string): User's natural language query
@@ -292,7 +418,7 @@ const result = await extractContactsWithLLM(
 ```
 
 ### `clearChatHistory(sessionId)`
-Clears message history for a specific session.
+Clears conversation memory and token usage stats for a specific session.
 
 **Parameters:**
 - `sessionId` (string): Session identifier to clear
@@ -311,6 +437,33 @@ Returns list of active session IDs.
 ```typescript
 const sessions = getActiveSessions();
 console.log(`Active sessions: ${sessions.length}`);
+```
+
+### `getSessionTokenUsage(sessionId)`
+Get token usage statistics for a specific session.
+
+**Parameters:**
+- `sessionId` (string): Session identifier
+
+**Returns:** `TokenUsageStats | null`
+
+**Example:**
+```typescript
+const usage = getSessionTokenUsage("user_12345");
+console.log(`Total tokens: ${usage?.totalTokens}`);
+```
+
+### `getAllTokenUsage()`
+Get token usage statistics for all active sessions.
+
+**Returns:** `Record<string, TokenUsageStats>`
+
+**Example:**
+```typescript
+const allUsage = getAllTokenUsage();
+Object.entries(allUsage).forEach(([sessionId, stats]) => {
+  console.log(`${sessionId}: ${stats.totalTokens} tokens`);
+});
 ```
 
 ## Monitoring and Debugging

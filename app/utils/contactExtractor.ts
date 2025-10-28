@@ -2,20 +2,387 @@
 import { ChatOpenAI } from "@langchain/openai";
 import { ChatPromptTemplate } from "@langchain/core/prompts";
 import { RunnableWithMessageHistory } from "@langchain/core/runnables";
-import { InMemoryChatMessageHistory } from "@langchain/core/chat_history";
-import { ContactExtractionResponse } from "../types/contact";
+import { BaseMessage, HumanMessage, AIMessage, SystemMessage } from "@langchain/core/messages";
+import { ContactExtractionResponse, AppointmentSchema, NoteSchema } from "../types/contact";
 import { ContactExtractionResponseZod } from "./contactSchemas";
 
-// Message history storage (in-memory)
-// In production, use Redis or database-backed storage
-const messageHistories: Record<string, InMemoryChatMessageHistory> = {};
+// Structured Context for better continuation handling
+interface StructuredContext {
+  pendingAppointments: AppointmentSchema[];
+  pendingTasks: Array<{
+    name: string;
+    intent: string;
+    id: string;
+    type: string;
+    is_completed: number;
+    dueDate: string;
+    dueDateTime: string;
+  }>;
+  pendingNotes: NoteSchema[];
+  hasAskForMoreInfo: boolean;
+  lastAsk: string;
+  disambiguationType: 'contact' | 'appointment' | 'task' | 'note' | 'other' | null;
+  disambiguationItems: any[]; // Items user is choosing from
+  knownContacts: Array<{
+    name: string;
+    firstName: string;
+    lastName: string;
+    phone: string;
+    email: string;
+  }>;
+  lastOperation: {
+    intent: string;
+    contactName: string;
+    timestamp: string;
+  } | null;
+}
 
-// Function to get or create message history for a session
-function getMessageHistory(sessionId: string): InMemoryChatMessageHistory {
-  if (!messageHistories[sessionId]) {
-    messageHistories[sessionId] = new InMemoryChatMessageHistory();
+// Custom Conversation Summary Memory Implementation with Structured Context
+interface ConversationMemory {
+  summary: string;
+  recentMessages: BaseMessage[];
+  messageCount: number;
+  maxMessages: number;
+  structuredContext: StructuredContext;
+}
+
+// Conversation memory storage (in-memory)
+// In production, use Redis or database-backed storage
+const conversationMemories: Record<string, ConversationMemory> = {};
+
+// Token usage tracking per session
+interface TokenUsageStats {
+  totalTokens: number;
+  promptTokens: number;
+  completionTokens: number;
+  messagesCount: number;
+  lastUpdated: Date;
+}
+
+const tokenUsageStats: Record<string, TokenUsageStats> = {};
+
+// Function to summarize conversation history
+async function summarizeConversation(messages: BaseMessage[], sessionId: string): Promise<string> {
+  try {
+    const llm = new ChatOpenAI({
+      modelName: "gpt-4o-mini", // Use smaller model for summaries to save costs
+      temperature: 0,
+      apiKey: process.env.OPENAI_API_KEY,
+      callbacks: [
+        {
+          handleLLMEnd: async (output) => {
+            if (output.llmOutput?.tokenUsage) {
+              const usage = output.llmOutput.tokenUsage;
+              updateTokenUsage(sessionId, {
+                promptTokens: usage.promptTokens || 0,
+                completionTokens: usage.completionTokens || 0,
+                totalTokens: usage.totalTokens || 0,
+              });
+            }
+          },
+        },
+      ],
+    });
+
+    const conversationText = messages
+      .map((m) => `${m._getType()}: ${typeof m.content === 'string' ? m.content : JSON.stringify(m.content)}`)
+      .join('\n');
+
+    const summaryPrompt = `Summarize the following conversation, preserving key contact information, activities, and context:\n\n${conversationText}\n\nSummary:`;
+    
+    const summary = await llm.invoke([new HumanMessage(summaryPrompt)]);
+    return typeof summary.content === 'string' ? summary.content : JSON.stringify(summary.content);
+  } catch (error) {
+    console.error('Error summarizing conversation:', error);
+    return 'Previous conversation history (summarization failed)';
   }
-  return messageHistories[sessionId];
+}
+
+// Function to get or create conversation memory for a session
+function getConversationMemory(sessionId: string): ConversationMemory {
+  if (!conversationMemories[sessionId]) {
+    conversationMemories[sessionId] = {
+      summary: '',
+      recentMessages: [],
+      messageCount: 0,
+      maxMessages: 10, // Keep last 10 messages before summarizing
+      structuredContext: {
+        pendingAppointments: [],
+        pendingTasks: [],
+        pendingNotes: [],
+        hasAskForMoreInfo: false,
+        lastAsk: '',
+        disambiguationType: null,
+        disambiguationItems: [],
+        knownContacts: [],
+        lastOperation: null,
+      },
+    };
+    
+    console.log(`🧠 Created new conversation memory for session: ${sessionId}`);
+  }
+  return conversationMemories[sessionId];
+}
+
+/**
+ * Extract structured context from AI response
+ */
+function extractStructuredContext(aiResponse: ContactExtractionResponse): Partial<StructuredContext> {
+  const context: Partial<StructuredContext> = {
+    pendingAppointments: [],
+    pendingTasks: [],
+    pendingNotes: [],
+    hasAskForMoreInfo: !!aiResponse.ask_for_more_info,
+    lastAsk: aiResponse.ask_for_more_info || '',
+    disambiguationType: null,
+    disambiguationItems: [],
+    knownContacts: [],
+  };
+
+  // Extract contacts and their activities
+  if (aiResponse.contacts && aiResponse.contacts.length > 0) {
+    aiResponse.contacts.forEach(contact => {
+      const input = contact.input_contact;
+      
+      // Add to known contacts if has name
+      if (input.first_name || input.last_name) {
+        const contactName = `${input.first_name} ${input.last_name}`.trim();
+        if (contactName) {
+          context.knownContacts!.push({
+            name: contactName,
+            firstName: input.first_name,
+            lastName: input.last_name,
+            phone: input.phone,
+            email: input.email,
+          });
+        }
+      }
+
+      // If ask_for_more_info exists, determine type and save items
+      if (aiResponse.ask_for_more_info) {
+        const askLower = aiResponse.ask_for_more_info.toLowerCase();
+        
+        // Determine disambiguation type
+        if (askLower.includes('appointment')) {
+          context.disambiguationType = 'appointment';
+          context.disambiguationItems = [...(input.appointments || [])];
+        } else if (askLower.includes('task')) {
+          context.disambiguationType = 'task';
+          context.disambiguationItems = [...(input.tasks || [])];
+        } else if (askLower.includes('contact')) {
+          context.disambiguationType = 'contact';
+        } else {
+          // Default: pending activities (for contact details scenario)
+          context.pendingAppointments = [...(input.appointments || [])];
+          context.pendingTasks = [...(input.tasks?.map(t => t.input) || [])];
+          context.pendingNotes = [...(input.notes || [])];
+        }
+      }
+    });
+  }
+
+  return context;
+}
+
+/**
+ * Merge structured context with memory
+ */
+function mergeStructuredContext(memory: ConversationMemory, newContext: Partial<StructuredContext>): void {
+  if (!memory.structuredContext) {
+    memory.structuredContext = {
+      pendingAppointments: [],
+      pendingTasks: [],
+      pendingNotes: [],
+      hasAskForMoreInfo: false,
+      lastAsk: '',
+      disambiguationType: null,
+      disambiguationItems: [],
+      knownContacts: [],
+      lastOperation: null,
+    };
+  }
+
+  // Update with new context
+  if (newContext.hasAskForMoreInfo) {
+    // Keep pending items or disambiguation items
+    memory.structuredContext.pendingAppointments = newContext.pendingAppointments || [];
+    memory.structuredContext.pendingTasks = newContext.pendingTasks || [];
+    memory.structuredContext.pendingNotes = newContext.pendingNotes || [];
+    memory.structuredContext.disambiguationType = newContext.disambiguationType || null;
+    memory.structuredContext.disambiguationItems = newContext.disambiguationItems || [];
+    memory.structuredContext.hasAskForMoreInfo = true;
+    memory.structuredContext.lastAsk = newContext.lastAsk || '';
+  } else {
+    // Clear all pending items
+    memory.structuredContext.pendingAppointments = [];
+    memory.structuredContext.pendingTasks = [];
+    memory.structuredContext.pendingNotes = [];
+    memory.structuredContext.disambiguationType = null;
+    memory.structuredContext.disambiguationItems = [];
+    memory.structuredContext.hasAskForMoreInfo = false;
+    memory.structuredContext.lastAsk = '';
+  }
+
+  // Merge known contacts (avoid duplicates)
+  if (newContext.knownContacts) {
+    newContext.knownContacts.forEach(newContact => {
+      const exists = memory.structuredContext.knownContacts.some(
+        existing => existing.name === newContact.name
+      );
+      if (!exists && newContact.name) {
+        memory.structuredContext.knownContacts.push(newContact);
+      }
+    });
+  }
+}
+
+/**
+ * Build structured context string for LLM prompt
+ */
+function buildStructuredContextPrompt(context: StructuredContext): string {
+  const parts: string[] = [];
+
+  // Known contacts
+  if (context.knownContacts.length > 0) {
+    parts.push('KNOWN CONTACTS:');
+    context.knownContacts.forEach((contact, idx) => {
+      const details: string[] = [];
+      if (contact.phone) details.push(`phone: ${contact.phone}`);
+      if (contact.email) details.push(`email: ${contact.email}`);
+      const detailsStr = details.length > 0 ? ` (${details.join(', ')})` : '';
+      parts.push(`${idx + 1}. ${contact.name}${detailsStr}`);
+    });
+    parts.push('');
+  }
+
+  // Pending operations or disambiguation
+  if (context.hasAskForMoreInfo) {
+    parts.push('PENDING OPERATION:');
+    parts.push(`Question: "${context.lastAsk}"`);
+    parts.push('');
+    
+    // Disambiguation items (user choosing from these)
+    if (context.disambiguationType && context.disambiguationItems.length > 0) {
+      parts.push(`Choosing ${context.disambiguationType} (${context.disambiguationItems.length} options):`);
+      context.disambiguationItems.forEach((item: any, idx: number) => {
+        if (context.disambiguationType === 'appointment') {
+          const loc = item.location ? ` at ${item.location}` : '';
+          parts.push(`  ${idx + 1}. ${item.title}${loc} - ${item.start}`);
+        } else if (context.disambiguationType === 'task') {
+          parts.push(`  ${idx + 1}. ${item.name} - due ${item.dueDate}`);
+        }
+      });
+      parts.push('');
+    }
+    
+    // Pending activities (waiting for contact)
+    if (context.pendingAppointments.length > 0) {
+      parts.push(`Pending appointments (${context.pendingAppointments.length}):`);
+      context.pendingAppointments.forEach((appt, idx) => {
+        const loc = appt.location ? ` at ${appt.location}` : '';
+        parts.push(`  ${idx + 1}. ${appt.title}${loc} - ${appt.start}`);
+      });
+      parts.push('');
+    }
+    
+    if (context.pendingTasks.length > 0) {
+      parts.push(`Pending tasks: ${context.pendingTasks.length}`);
+      parts.push('');
+    }
+  }
+
+  return parts.length > 0 ? parts.join('\n') : 'No previous context';
+}
+
+// Save conversation to memory with automatic summarization and structured context
+async function saveConversationToMemory(
+  sessionId: string,
+  userMessage: string,
+  aiResponse: string
+): Promise<void> {
+  const memory = getConversationMemory(sessionId);
+  
+  // Parse AI response to extract structured context
+  try {
+    const parsedResponse: ContactExtractionResponse = JSON.parse(aiResponse);
+    const newContext = extractStructuredContext(parsedResponse);
+    mergeStructuredContext(memory, newContext);
+    
+    console.log(`📋 Structured context updated:`, {
+      pendingAppointments: memory.structuredContext.pendingAppointments.length,
+      pendingTasks: memory.structuredContext.pendingTasks.length,
+      hasAsk: memory.structuredContext.hasAskForMoreInfo,
+      knownContacts: memory.structuredContext.knownContacts.length,
+    });
+  } catch (error) {
+    console.error('Failed to parse AI response for structured context:', error);
+  }
+  
+  // Add new messages
+  memory.recentMessages.push(new HumanMessage(userMessage));
+  memory.recentMessages.push(new AIMessage(aiResponse));
+  memory.messageCount += 2;
+
+  // If we have too many messages, summarize older ones
+  if (memory.recentMessages.length > memory.maxMessages) {
+    console.log(`🔄 Summarizing conversation for session ${sessionId} (${memory.recentMessages.length} messages)`);
+    
+    // Take messages to summarize (keep last 4 messages as recent)
+    const messagesToSummarize = memory.recentMessages.slice(0, -4);
+    const recentMessages = memory.recentMessages.slice(-4);
+    
+    // Create new summary
+    const oldSummary = memory.summary ? `Previous summary: ${memory.summary}\n\n` : '';
+    const conversationToSummarize = messagesToSummarize;
+    const newSummary = await summarizeConversation(conversationToSummarize, sessionId);
+    
+    memory.summary = oldSummary + newSummary;
+    memory.recentMessages = recentMessages;
+    
+    console.log(`✅ Conversation summarized. Summary length: ${memory.summary.length} chars, Recent messages: ${memory.recentMessages.length}`);
+  }
+}
+
+// Load conversation memory as messages
+function loadConversationMemory(sessionId: string): BaseMessage[] {
+  const memory = getConversationMemory(sessionId);
+  const messages: BaseMessage[] = [];
+  
+  // Add summary as system message if exists
+  if (memory.summary) {
+    messages.push(new SystemMessage(`Conversation summary: ${memory.summary}`));
+  }
+  
+  // Add recent messages
+  messages.push(...memory.recentMessages);
+  
+  return messages;
+}
+
+// Initialize or get token usage stats
+function getTokenUsageStats(sessionId: string): TokenUsageStats {
+  if (!tokenUsageStats[sessionId]) {
+    tokenUsageStats[sessionId] = {
+      totalTokens: 0,
+      promptTokens: 0,
+      completionTokens: 0,
+      messagesCount: 0,
+      lastUpdated: new Date(),
+    };
+  }
+  return tokenUsageStats[sessionId];
+}
+
+// Update token usage stats
+function updateTokenUsage(sessionId: string, usage: { promptTokens: number; completionTokens: number; totalTokens: number }): void {
+  const stats = getTokenUsageStats(sessionId);
+  stats.totalTokens += usage.totalTokens;
+  stats.promptTokens += usage.promptTokens;
+  stats.completionTokens += usage.completionTokens;
+  stats.messagesCount += 1;
+  stats.lastUpdated = new Date();
+  
+  console.log(`📊 Token Usage [${sessionId}]: Total=${stats.totalTokens}, Prompt=${stats.promptTokens}, Completion=${stats.completionTokens}, Messages=${stats.messagesCount}`);
 }
 
 /**
@@ -23,9 +390,13 @@ function getMessageHistory(sessionId: string): InMemoryChatMessageHistory {
  * Useful for starting fresh conversations
  */
 export function clearChatHistory(sessionId: string): void {
-  if (messageHistories[sessionId]) {
-    delete messageHistories[sessionId];
-    console.log(`🗑️ Cleared chat history for session: ${sessionId}`);
+  if (conversationMemories[sessionId]) {
+    delete conversationMemories[sessionId];
+    console.log(`🗑️ Cleared conversation memory for session: ${sessionId}`);
+  }
+  if (tokenUsageStats[sessionId]) {
+    delete tokenUsageStats[sessionId];
+    console.log(`🗑️ Cleared token usage stats for session: ${sessionId}`);
   }
 }
 
@@ -34,7 +405,21 @@ export function clearChatHistory(sessionId: string): void {
  * Useful for monitoring and cleanup
  */
 export function getActiveSessions(): string[] {
-  return Object.keys(messageHistories);
+  return Object.keys(conversationMemories);
+}
+
+/**
+ * Get token usage statistics for a session
+ */
+export function getSessionTokenUsage(sessionId: string): TokenUsageStats | null {
+  return tokenUsageStats[sessionId] || null;
+}
+
+/**
+ * Get token usage for all sessions
+ */
+export function getAllTokenUsage(): Record<string, TokenUsageStats> {
+  return { ...tokenUsageStats };
 }
 
 /**
@@ -90,100 +475,60 @@ export async function extractContactsWithLLM(
   ];
   const availableStagesStr = availableStages.join(", ");
 
-  // Get chat history for context
-  const currentHistory = getMessageHistory(userId);
-  const historyMessages = await currentHistory.getMessages();
-  const chatHistoryContent = historyMessages
-    .filter(msg => msg._getType() === 'human')
-    .map(msg => typeof msg.content === 'string' ? msg.content : '')
-    .join('\n');
+  // Get conversation memory for context
+  const memory = getConversationMemory(userId);
+  
+  // Load memory (includes summary and recent messages)
+  const historyMessages = loadConversationMemory(userId);
+  
+  // Build structured context prompt from memory
+  const structuredContextPrompt = buildStructuredContextPrompt(memory.structuredContext);
+  
+  console.log(`🧠 Loaded conversation memory with ${historyMessages.length} messages (${memory.summary ? 'with summary' : 'no summary'})`);
+  console.log(`📋 Structured context:`, {
+    knownContacts: memory.structuredContext.knownContacts.length,
+    pendingAppointments: memory.structuredContext.pendingAppointments.length,
+    pendingTasks: memory.structuredContext.pendingTasks.length,
+    hasAsk: memory.structuredContext.hasAskForMoreInfo,
+  });
 
-  // Analyze chat history to find the most recent contact with activities
-  let mostRecentActiveContact = null;
-  let mostRecentActivity = null;
-  let mostRecentContactInfo = null;
-  let firstContactWithActivities = null;
-  let firstContactInfo = null;
-  
-  // Let LLM handle contact detection - no regex needed
-  const currentQueryContact = null; // Always let LLM determine contact from context
-  
-  // Track all contacts from conversation in chronological order
-  const allContactsWithActivities = [];
-  
-  // Parse ALL messages to get chronological contact list
-  for (let i = 0; i < historyMessages.length; i++) {
-    const msg = historyMessages[i];
-    if (msg._getType() === 'ai' && typeof msg.content === 'string') {
-      try {
-        const parsedResponse = JSON.parse(msg.content);
-        if (parsedResponse.contacts && parsedResponse.contacts.length > 0) {
-          const contact = parsedResponse.contacts[0].input_contact;
-          const contactName = `${contact.first_name} ${contact.last_name}`.trim();
-          if (contactName && contactName !== ' ') {
-            allContactsWithActivities.push({
-              contact: contactName,
-              info: contact,
-              timestamp: i,
-              hasActivities: contact.tasks && contact.tasks.length > 0 || contact.appointments && contact.appointments.length > 0
-            });
-          }
-        }
-      } catch (e) {
-        // Not JSON, continue
-      }
-    }
-  }
-  
-  // Set first contact (chronologically first)
-  if (allContactsWithActivities.length > 0) {
-    const firstContact = allContactsWithActivities[0];
-    firstContactWithActivities = firstContact.contact;
-    firstContactInfo = firstContact.info;
-  }
-  
-  // Set most recent contact (chronologically last)
-  if (allContactsWithActivities.length > 0) {
-    const lastContact = allContactsWithActivities[allContactsWithActivities.length - 1];
-    mostRecentActiveContact = lastContact.contact;
-    mostRecentContactInfo = lastContact.info;
-  }
-  
-  // If current query has a new contact, update most recent to that contact
-  if (currentQueryContact) {
-    mostRecentActiveContact = currentQueryContact;
-    mostRecentContactInfo = null; // Clear old contact info
-  }
-  
-  // Let LLM handle contact detection from chat history - no regex parsing needed
-
-  // Create the extraction prompt (converted from Python)
+  // Create the extraction prompt with structured context
   const prompt = `
 Extract contact information from: "${query}"
 
-CONTEXT:
-${chatHistoryContent ? `History: ${chatHistoryContent}` : 'No history'}
-Most Recent: ${mostRecentActiveContact || 'None'}
-First: ${firstContactWithActivities || 'None'}
+STRUCTURED CONTEXT:
+${structuredContextPrompt}
 
 RULES:
 1. If query mentions specific name → use that contact (HIGHEST PRIORITY)
-2. If "last task/appointment" → use Most Recent contact  
-3. If "first task/appointment" → use First contact
-4. If no name mentioned → use Most Recent contact
-5. CRITICAL: When no contact name is mentioned, ALWAYS use the most recent contact from chat history
-6. CRITICAL: NEVER create empty contacts when there's a contact in history
-
-CRITICAL: When query mentions a specific contact name, IGNORE chat history and use that contact.
-
-EXAMPLE: If query is "Update Jane Miller's email" → use Jane Miller, NOT Sarah Williams from history.
-EXAMPLE: If query is "Schedule showing at 789 Pine Ave" → use Sarah Williams from history, NOT create empty contact.
+2. If KNOWN CONTACTS exist → use them for context
+3. For operations on "first/second/last appointment/task" → CHECK MOST RECENT AI MESSAGE in history for the list of appointments/tasks
+4. NEVER create empty contacts when known contacts exist
+5. If no name mentioned → use first known contact
 
 INTENTS:
 - DELETE: "cancel", "delete", "remove" → intent:"delete"
 - UPDATE: "update", "change", "modify" → intent:"update"
 - ADD: "add", "create", "schedule" → intent:"add" 
 - LIST: "show", "list", "find" → intent:"list"
+
+FIELD PRESERVATION: When referencing existing tasks/appointments, ALWAYS preserve ALL original fields (title, start, end, location, description, type, id, etc.). Look at the LAST AI RESPONSE in chat history to get current appointments/tasks. Only change intent and update specific fields mentioned.
+
+CONTINUATION HANDLING (CRITICAL): If STRUCTURED CONTEXT shows PENDING OPERATION:
+1. User is responding to the question in "Question asked"
+2. Extract contact details from current query (name, phone, or email)
+3. Attach ALL pending appointments/tasks/notes to this contact
+4. Clear ask_for_more_info field
+5. Return complete contact with all pending items
+Example: PENDING OPERATION shows 2 pending appointments + user provides "Sarah Williams" → Return Sarah Williams WITH those 2 appointments attached
+
+AMBIGUITY HANDLING - Set ask_for_more_info:
+1. Multiple contacts exist and query doesn't specify which
+2. Multiple appointments/tasks and query says "the appointment/task" → INCLUDE ALL in response, ask which
+3. CRITICAL: Creating appointments/tasks/notes but first_name AND last_name are empty AND no known contacts exist → ask_for_more_info="Please provide contact details (name, phone, or email) to link these activities."
+4. Query unclear or missing info
+
+DISAMBIGUATION: When user says "first/1/second/2/both/all" referring to appointments/tasks, extract the FULL LIST from the most recent AI response in chat history, select the item(s), preserve ALL fields, and apply only the operation (delete/update) to selected item(s).
 
 EXTRACTION:
 - Extract contacts, tasks, appointments, notes from query
@@ -196,7 +541,8 @@ RESPONSE FORMAT:
 {
   "contacts": [{"input_contact": {"id": "temp_contact_1", "first_name": "", "last_name": "", "phone": "", "email": "", "stage": "Lead", "source": "sumiAgent", "intent": "add", "operation": "add", "notes": [], "tasks": [], "appointments": [], "validations": {"missing_fields": [], "invalid_fields": []}}, "update_contact": {}, "approved": false}],
   "language": "english",
-  "skip_to": ""
+  "skip_to": "",
+  "ask_for_more_info": ""
 }
 `;
 
@@ -205,37 +551,36 @@ RESPONSE FORMAT:
     console.log(`💬 User ID: ${userId}`);
     console.log(`📝 Query: "${query}"`);
 
-    console.log(`📚 History before invoke: ${historyMessages.length} messages`);
-    if (historyMessages.length > 0) {
-      console.log(`📜 Last messages:`, historyMessages.slice(-2).map(m => ({
-        type: m._getType(),
-        content: typeof m.content === 'string' ? m.content.substring(0, 100) : m.content
-      })));
-    }
-    
-    console.log(`📋 Chat history content: ${chatHistoryContent.substring(0, 200)}...`);
-    console.log(`🎯 Most recent active contact: ${mostRecentActiveContact || 'None'}`);
-    console.log(`🥇 First active contact: ${firstContactWithActivities || 'None'}`);
-    console.log(`📊 All contacts in order: ${allContactsWithActivities.map(c => c.contact).join(' → ')}`);
-    console.log(`🤖 Using LLM for contact detection (no regex patterns)`);
-    if (mostRecentContactInfo) {
-      console.log(`👤 Most recent contact info: ${JSON.stringify(mostRecentContactInfo, null, 2)}`);
-    }
-    if (firstContactInfo) {
-      console.log(`👤 First contact info: ${JSON.stringify(firstContactInfo, null, 2)}`);
-    }
+    const historyLength = historyMessages.length;
+    console.log(`📚 History: ${historyLength} messages`);
+    console.log(`📋 Structured Context Preview:`, structuredContextPrompt.substring(0, 300) + (structuredContextPrompt.length > 300 ? '...' : ''));
 
-    // Initialize LangChain LLM with structured output
+    // Initialize LangChain LLM with structured output and callbacks for token tracking
     const llm = new ChatOpenAI({
       modelName: "gpt-4o", // or "gpt-4-turbo" for better accuracy
       temperature: 0.1, // Low temperature for consistent extraction
       apiKey: process.env.OPENAI_API_KEY,
+      callbacks: [
+        {
+          handleLLMEnd: async (output) => {
+            // Track token usage from LLM response
+            if (output.llmOutput?.tokenUsage) {
+              const usage = output.llmOutput.tokenUsage;
+              updateTokenUsage(userId, {
+                promptTokens: usage.promptTokens || 0,
+                completionTokens: usage.completionTokens || 0,
+                totalTokens: usage.totalTokens || 0,
+              });
+            }
+          },
+        },
+      ],
     }).withStructuredOutput(ContactExtractionResponseZod);
 
     // Build messages array with history
     const messages: any[] = [
       ["system", prompt],
-      ...historyMessages, // Add existing history
+      ...historyMessages, // Add existing history (includes summary as system message if present)
       ["human", `Extract contact information from this query: ${query}`],
     ];
 
@@ -244,18 +589,20 @@ RESPONSE FORMAT:
     // Invoke LLM directly with history
     const parsedData = await llm.invoke(messages) as ContactExtractionResponse;
 
-    // Manually save to history - add user message and assistant response
-    await currentHistory.addUserMessage(query);
-    await currentHistory.addAIMessage(JSON.stringify(parsedData));
+    // Save conversation to memory (this will automatically summarize if needed)
+    await saveConversationToMemory(userId, query, JSON.stringify(parsedData));
 
-    // Check history after saving
-    const updatedHistory = await currentHistory.getMessages();
-    console.log(`📚 History after invoke: ${updatedHistory.length} messages`);
-    if (updatedHistory.length > historyMessages.length) {
-      console.log(`✅ New messages added to history!`);
+    // Check memory after saving
+    const updatedMemory = getConversationMemory(userId);
+    const updatedHistory = loadConversationMemory(userId);
+    const updatedLength = updatedHistory.length;
+    console.log(`📚 Memory after invoke: ${updatedLength} messages`);
+    if (updatedLength > historyLength) {
+      console.log(`✅ New messages added to conversation memory!`);
     } else {
-      console.log(`⚠️ WARNING: No new messages added to history!`);
+      console.log(`🔄 Memory was summarized to conserve tokens`);
     }
+    console.log(`📊 Total messages in session: ${updatedMemory.messageCount}, Summary: ${updatedMemory.summary ? 'Yes' : 'No'}`);
     
     console.log(
       `✅ Extracted ${parsedData.contacts.length} contacts, language=${parsedData.language}, skip_to=${parsedData.skip_to}`

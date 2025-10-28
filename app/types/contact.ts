@@ -73,5 +73,6 @@ export interface ContactExtractionResponse {
   contacts: ContactSchema[];
   language: "spanish" | "english";
   skip_to: string; // 'list_tasks', 'list_appointments', or empty
+  ask_for_more_info?: string; // Question to ask user when query is ambiguous
 }
 

@@ -64,7 +64,13 @@ export const UpdateContactSchemaZod = z.object({
 
 export const ContactSchemaZod = z.object({
   input_contact: InputContactSchemaZod,
-  update_contact: UpdateContactSchemaZod.default({}),
+  update_contact: UpdateContactSchemaZod.default({
+    first_name: null,
+    last_name: null,
+    phone: null,
+    email: null,
+    stage: null,
+  }),
   approved: z.boolean().default(false),
 });
 
@@ -72,5 +78,6 @@ export const ContactExtractionResponseZod = z.object({
   contacts: z.array(ContactSchemaZod).describe("List of extracted contacts with activities"),
   language: z.enum(["spanish", "english"]).describe("Detected language"),
   skip_to: z.string().default("").describe("Direct routing target: 'list_tasks', 'list_appointments', or empty"),
+  ask_for_more_info: z.string().default("").describe("Question to ask user when query is ambiguous (e.g., multiple appointments match). Empty if no clarification needed."),
 });
 

@@ -1,5 +1,5 @@
 import { NextRequest, NextResponse } from "next/server";
-import { extractContactsWithLLM } from "@/app/utils/contactExtractor";
+import { extractContactsWithLLM, getSessionTokenUsage } from "@/app/utils/contactExtractor";
 
 export async function POST(request: NextRequest) {
   try {
@@ -15,11 +15,21 @@ export async function POST(request: NextRequest) {
       userId
     );
 
-    // Return structured JSON response with extracted data
+    // Get token usage statistics for this session
+    const tokenUsage = getSessionTokenUsage(userId);
+
+    // Return structured JSON response with extracted data and token usage
     return NextResponse.json({
       success: true,
       message: "Contact information extracted successfully",
       data: extractionResult,
+      tokenUsage: tokenUsage ? {
+        totalTokens: tokenUsage.totalTokens,
+        promptTokens: tokenUsage.promptTokens,
+        completionTokens: tokenUsage.completionTokens,
+        messagesCount: tokenUsage.messagesCount,
+        lastUpdated: tokenUsage.lastUpdated,
+      } : null,
       timestamp: new Date().toISOString(),
     });
   } catch (error) {

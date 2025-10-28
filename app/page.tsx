@@ -80,10 +80,16 @@ export default function Home() {
       // If extraction was successful, format a nice response
       if (data.success && data.data) {
         const extractionData = data.data;
-        botText = `✅ Extracted successfully!\n\nLanguage: ${extractionData.language}\nContacts: ${extractionData.contacts.length}`;
         
-        // Add contact details if available
-        if (extractionData.contacts.length > 0) {
+        // Check if we need to ask for more information (ambiguous query)
+        if (extractionData.ask_for_more_info) {
+          botText = `❓ ${extractionData.ask_for_more_info}`;
+        } else {
+          botText = `✅ Extracted successfully!\n\nLanguage: ${extractionData.language}\nContacts: ${extractionData.contacts.length}`;
+        }
+        
+        // Add contact details if available and not asking for clarification
+        if (extractionData.contacts.length > 0 && !extractionData.ask_for_more_info) {
           extractionData.contacts.forEach((contact: any, idx: number) => {
             const inputContact = contact.input_contact;
             botText += `\n\nContact ${idx + 1}:`;
