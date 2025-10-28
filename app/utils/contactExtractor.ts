@@ -29,6 +29,7 @@ interface StructuredContext {
     lastName: string;
     phone: string;
     email: string;
+    lastSeen?: number; // Timestamp when contact was last seen
   }>;
   lastOperation: {
     intent: string;
@@ -148,13 +149,24 @@ function extractStructuredContext(aiResponse: ContactExtractionResponse): Partia
       if (input.first_name || input.last_name) {
         const contactName = `${input.first_name} ${input.last_name}`.trim();
         if (contactName) {
-          context.knownContacts!.push({
+          // Check if contact already exists and update it, or add new one
+          const existingIndex = context.knownContacts!.findIndex(c => c.name === contactName);
+          const contactInfo = {
             name: contactName,
             firstName: input.first_name,
             lastName: input.last_name,
             phone: input.phone,
             email: input.email,
-          });
+            lastSeen: Date.now(), // Track when contact was last seen
+          };
+          
+          if (existingIndex >= 0) {
+            // Update existing contact with new info and timestamp
+            context.knownContacts![existingIndex] = contactInfo;
+          } else {
+            // Add new contact
+            context.knownContacts!.push(contactInfo);
+          }
         }
       }
 
@@ -182,6 +194,28 @@ function extractStructuredContext(aiResponse: ContactExtractionResponse): Partia
   }
 
   return context;
+}
+
+/**
+ * Get the most recent contact from known contacts
+ */
+function getMostRecentContact(knownContacts: Array<{name: string; lastSeen?: number}>): string | null {
+  if (knownContacts.length === 0) return null;
+  
+  // Sort by lastSeen timestamp (most recent first)
+  const sortedContacts = [...knownContacts].sort((a, b) => (b.lastSeen || 0) - (a.lastSeen || 0));
+  return sortedContacts[0].name;
+}
+
+/**
+ * Get the first contact from known contacts (chronologically first)
+ */
+function getFirstContact(knownContacts: Array<{name: string; lastSeen?: number}>): string | null {
+  if (knownContacts.length === 0) return null;
+  
+  // Sort by lastSeen timestamp (oldest first)
+  const sortedContacts = [...knownContacts].sort((a, b) => (a.lastSeen || 0) - (b.lastSeen || 0));
+  return sortedContacts[0].name;
 }
 
 /**
@@ -245,13 +279,41 @@ function buildStructuredContextPrompt(context: StructuredContext): string {
   // Known contacts
   if (context.knownContacts.length > 0) {
     parts.push('KNOWN CONTACTS:');
+    
+    // Get most recent and first contacts
+    const mostRecentContact = getMostRecentContact(context.knownContacts);
+    const firstContact = getFirstContact(context.knownContacts);
+    
     context.knownContacts.forEach((contact, idx) => {
       const details: string[] = [];
       if (contact.phone) details.push(`phone: ${contact.phone}`);
       if (contact.email) details.push(`email: ${contact.email}`);
       const detailsStr = details.length > 0 ? ` (${details.join(', ')})` : '';
-      parts.push(`${idx + 1}. ${contact.name}${detailsStr}`);
+      
+      // Mark most recent and first contacts
+      let indicators = '';
+      if (contact.name === mostRecentContact) indicators += ' (MOST RECENT)';
+      if (contact.name === firstContact) indicators += ' (FIRST)';
+      
+      parts.push(`${idx + 1}. ${contact.name}${detailsStr}${indicators}`);
     });
+    
+    // Add context information
+    if (mostRecentContact) {
+      parts.push(`MOST RECENT CONTACT: ${mostRecentContact}`);
+    }
+    if (firstContact && firstContact !== mostRecentContact) {
+      parts.push(`FIRST CONTACT: ${firstContact}`);
+    }
+    
+    // Debug: Show contact order
+    console.log(`🔍 Contact tracking:`, {
+      total: context.knownContacts.length,
+      mostRecent: mostRecentContact,
+      first: firstContact,
+      allContacts: context.knownContacts.map(c => ({ name: c.name, lastSeen: c.lastSeen }))
+    });
+    
     parts.push('');
   }
 
@@ -502,9 +564,10 @@ ${structuredContextPrompt}
 RULES:
 1. If query mentions specific name → use that contact (HIGHEST PRIORITY)
 2. If KNOWN CONTACTS exist → use them for context
-3. For operations on "first/second/last appointment/task" → CHECK MOST RECENT AI MESSAGE in history for the list of appointments/tasks
-4. NEVER create empty contacts when known contacts exist
-5. If no name mentioned → use first known contact
+3. For operations on "last appointment/task" → use MOST RECENT CONTACT
+4. For operations on "first appointment/task" → use FIRST CONTACT
+5. NEVER create empty contacts when known contacts exist
+6. If no name mentioned → use MOST RECENT CONTACT
 
 INTENTS:
 - DELETE: "cancel", "delete", "remove" → intent:"delete"
